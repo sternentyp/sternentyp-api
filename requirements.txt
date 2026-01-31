@@ -3,4 +3,5 @@ gunicorn==22.0.0
 pyswisseph==2.10.3.2
 pytz==2025.1
 timezonefinder==6.5.2
+h3==3.7.6
 geopy==2.4.1
