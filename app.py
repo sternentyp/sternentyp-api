@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
-import os
 import pytz
 import swisseph as swe
 from timezonefinder import TimezoneFinder
@@ -10,9 +9,6 @@ app = Flask(__name__)
 
 # Ephemeriden-Pfad
 swe.set_ephe_path("./ephe")
-
-# Premium Key (Render ENV)
-PREMIUM_API_KEY = os.environ.get("PREMIUM_API_KEY", "")
 
 ZODIAC_SIGNS = [
     "Widder", "Stier", "Zwillinge", "Krebs", "Löwe", "Jungfrau",
@@ -41,15 +37,6 @@ ASPECTS = [
     ("Trigon", 120.0, 6.0),
     ("Opposition", 180.0, 8.0),
 ]
-
-def require_premium():
-    """Simple Premium Gate via header X-API-Key"""
-    if not PREMIUM_API_KEY:
-        return False, ("Premium ist serverseitig nicht konfiguriert (PREMIUM_API_KEY fehlt).", 500)
-    key = request.headers.get("X-API-Key", "")
-    if key != PREMIUM_API_KEY:
-        return False, ("Premium-Funktion. Ungültiger oder fehlender API-Key.", 401)
-    return True, None
 
 def deg_to_sign(deg: float):
     deg = deg % 360.0
@@ -118,12 +105,10 @@ def calc_houses(jd_ut: float, lat: float, lon: float, house_system: str):
 def planet_house(planet_lon: float, houses_out: dict):
     """Return house number 1..12 by comparing to cusps (simple method)."""
     cusps = [houses_out[f"haus_{i}"] for i in range(1, 13)]
-    # Ensure monotonic by rotating around house 1 cusp
     base = cusps[0]
     adj_cusps = [norm360(c - base) for c in cusps]
     pl = norm360(planet_lon - base)
 
-    # determine in which interval pl lies
     for i in range(12):
         start = adj_cusps[i]
         end = adj_cusps[(i + 1) % 12]
@@ -131,12 +116,11 @@ def planet_house(planet_lon: float, houses_out: dict):
             if start <= pl < end:
                 return i + 1
         else:
-            # last interval wraps
             if pl >= start or pl < adj_cusps[0]:
                 return 12
     return 12
 
-def aspects_between(set_a: dict, set_b: dict, orb_multiplier_a=1.0, orb_multiplier_b=1.0):
+def aspects_between(set_a: dict, set_b: dict):
     """Find aspects between two sets of longitudes."""
     events = []
     for name_a, lon_a in set_a.items():
@@ -146,7 +130,6 @@ def aspects_between(set_a: dict, set_b: dict, orb_multiplier_a=1.0, orb_multipli
             d = angle_diff(lon_a, lon_b)
             for asp_name, exact, orb in ASPECTS:
                 orb_limit = orb
-                # allow slightly larger orb for luminaries if present
                 if name_a in ("Sonne", "Mond") or name_b in ("Sonne", "Mond"):
                     orb_limit = max(orb_limit, 8.0)
                 if abs(d - exact) <= orb_limit:
@@ -160,7 +143,6 @@ def aspects_between(set_a: dict, set_b: dict, orb_multiplier_a=1.0, orb_multipli
                         "body_2": name_b
                     })
                     break
-    # sort tightest first
     events.sort(key=lambda x: x["orb"])
     return events
 
@@ -211,9 +193,8 @@ def build_chart(payload: dict):
     # planet houses (natal)
     planet_houses = {k: planet_house(v, houses_out) for k, v in bodies_lon.items()}
 
-    # aspects among natal bodies (basic)
+    # aspects among natal bodies
     aspects = aspects_between(bodies_lon, bodies_lon)
-    # avoid duplicates in self-self aspects: keep only where body_1 < body_2 lexicographically
     dedup = []
     seen = set()
     for a in aspects:
@@ -260,28 +241,21 @@ def chart():
         return jsonify({"error": msg}), code
     return jsonify(chart_result)
 
-# PREMIUM: Transits for a period
+# FREE: Transits for a period
 @app.route("/transits", methods=["POST"])
 def transits():
-    ok, err = require_premium()
-    if not ok:
-        msg, code = err
-        return jsonify({"error": msg}), code
-
     payload = request.json or {}
-    natal = payload.get("natal")  # dict: date/time/place/lat/lon/timezone...
+    natal = payload.get("natal")
     if not natal:
         return jsonify({"error": "Missing required field: natal"}), 400
 
-    # timeframe
-    start_date = payload.get("start_date")  # YYYY-MM-DD
-    end_date = payload.get("end_date")      # YYYY-MM-DD
+    start_date = payload.get("start_date")
+    end_date = payload.get("end_date")
     step_hours = int(payload.get("step_hours", 6))
 
     if not start_date or not end_date:
         return jsonify({"error": "Missing required fields: start_date, end_date"}), 400
 
-    # Build natal
     natal_result, natal_err = build_chart(natal)
     if natal_err:
         msg, code = natal_err
@@ -290,23 +264,19 @@ def transits():
     zodiac = natal.get("zodiac", "tropical")
     flags = zodiac_flags(zodiac)
 
-    # parse dates in UTC windows (00:00 UTC start/end)
     start_dt_utc = datetime.fromisoformat(start_date + "T00:00:00").replace(tzinfo=pytz.UTC)
     end_dt_utc = datetime.fromisoformat(end_date + "T23:59:59").replace(tzinfo=pytz.UTC)
 
     natal_lons = {k: natal_result["bodies"][k]["ecliptic_longitude"] for k in natal_result["bodies"].keys()}
-    # include angles as natal points too (nice for “spicy” transits)
     natal_points = dict(natal_lons)
     natal_points["Aszendent"] = natal_result["ascendant"]["ecliptic_longitude"]
     natal_points["MC"] = natal_result["mc"]["ecliptic_longitude"]
 
-    # Which transit bodies to include (v1: all BODIES)
     transit_bodies = payload.get("transit_bodies")
     if not transit_bodies:
         transit_bodies = list(BODIES.keys())
 
-    # Peak tracking: keep best (minimum orb) per (transit, natal, aspect)
-    best = {}  # key -> event dict
+    best = {}
 
     t = start_dt_utc
     while t <= end_dt_utc:
@@ -318,7 +288,6 @@ def transits():
             lonlat, _ = swe.calc_ut(jd_ut, BODIES[name], flags)
             trans_lons[name] = lonlat[0] % 360.0
 
-        # compute aspects transits -> natal_points
         for tr_name, tr_lon in trans_lons.items():
             for nat_name, nat_lon in natal_points.items():
                 d = angle_diff(tr_lon, nat_lon)
@@ -346,16 +315,14 @@ def transits():
 
         t += timedelta(hours=step_hours)
 
-    # Build list sorted by tightest orb
     events = list(best.values())
     events.sort(key=lambda x: x["orb"])
 
-    # Simple “tension score” (v1): count hard aspects among Saturn/Uranus/Pluto to personal points
     hard = {"Quadrat", "Opposition", "Konjunktion"}
     heavy = {"Saturn", "Uranus", "Pluto"}
     personal = {"Sonne", "Mond", "Aszendent", "MC", "Merkur", "Venus", "Mars"}
     tension_hits = [e for e in events if e["aspect"] in hard and e["transit_body"] in heavy and e["natal_point"] in personal]
-    tension_score = min(100, len(tension_hits) * 12)  # simple scale
+    tension_score = min(100, len(tension_hits) * 12)
 
     out = {
         "natal": {
@@ -368,20 +335,15 @@ def transits():
             "end_date": end_date,
             "step_hours": step_hours
         },
-        "events": events[:200],  # keep response sane
+        "events": events[:200],
         "tension_score": tension_score,
         "tension_highlights": tension_hits[:25]
     }
     return jsonify(out)
 
-# PREMIUM: Synastry (A vs B)
+# FREE: Synastry (A vs B)
 @app.route("/synastry", methods=["POST"])
 def synastry():
-    ok, err = require_premium()
-    if not ok:
-        msg, code = err
-        return jsonify({"error": msg}), code
-
     payload = request.json or {}
     person_a = payload.get("person_a")
     person_b = payload.get("person_b")
@@ -401,7 +363,6 @@ def synastry():
     a_lons = {k: a_chart["bodies"][k]["ecliptic_longitude"] for k in a_chart["bodies"].keys()}
     b_lons = {k: b_chart["bodies"][k]["ecliptic_longitude"] for k in b_chart["bodies"].keys()}
 
-    # include angles as points for synastry spice
     a_points = dict(a_lons)
     a_points["Aszendent"] = a_chart["ascendant"]["ecliptic_longitude"]
     a_points["MC"] = a_chart["mc"]["ecliptic_longitude"]
@@ -410,7 +371,6 @@ def synastry():
     b_points["Aszendent"] = b_chart["ascendant"]["ecliptic_longitude"]
     b_points["MC"] = b_chart["mc"]["ecliptic_longitude"]
 
-    # aspects A->B
     syn_aspects = []
     for a_name, a_lon in a_points.items():
         for b_name, b_lon in b_points.items():
@@ -433,7 +393,6 @@ def synastry():
                     break
     syn_aspects.sort(key=lambda x: x["orb"])
 
-    # house overlays: where B planets fall into A houses
     a_houses_raw = {k: a_chart["houses"][k]["ecliptic_longitude"] for k in a_chart["houses"].keys()}
     overlays = {}
     for b_name, b_lon in b_lons.items():
@@ -456,5 +415,4 @@ def synastry():
     return jsonify(out)
 
 if __name__ == "__main__":
-    # local dev
     app.run(host="0.0.0.0", port=5000, debug=True)
