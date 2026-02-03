@@ -1,21 +1,29 @@
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
 import pytz
+import time
+from collections import defaultdict, deque
+
 import swisseph as swe
 from timezonefinder import TimezoneFinder
 from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderUnavailable, GeocoderTimedOut, GeocoderServiceError
 
 app = Flask(__name__)
 
-# Ephemeriden-Pfad
+# -------------------------
+# EPHEMERIS
+# -------------------------
 swe.set_ephe_path("./ephe")
 
+# -------------------------
+# CONSTANTS
+# -------------------------
 ZODIAC_SIGNS = [
     "Widder", "Stier", "Zwillinge", "Krebs", "Löwe", "Jungfrau",
     "Waage", "Skorpion", "Schütze", "Steinbock", "Wassermann", "Fische"
 ]
 
-# Bodies (Planeten + optionale Punkte)
 BODIES = {
     "Sonne": swe.SUN,
     "Mond": swe.MOON,
@@ -29,7 +37,6 @@ BODIES = {
     "Pluto": swe.PLUTO,
 }
 
-# Aspekte (v1)
 ASPECTS = [
     ("Konjunktion", 0.0, 8.0),
     ("Sextil", 60.0, 6.0),
@@ -38,6 +45,54 @@ ASPECTS = [
     ("Opposition", 180.0, 8.0),
 ]
 
+# -------------------------
+# ABUSE-SCHUTZ (LIGHT)
+# -------------------------
+RATE_LIMIT = 90        # max requests
+RATE_WINDOW = 60       # per 60 seconds
+_ip_requests = defaultdict(lambda: deque())
+
+def get_client_ip():
+    # Render/Proxy liefert oft X-Forwarded-For (ggf. Liste)
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+@app.before_request
+def rate_limit_guard():
+    ip = get_client_ip()
+    now = time.time()
+    q = _ip_requests[ip]
+    while q and (now - q[0]) > RATE_WINDOW:
+        q.popleft()
+    if len(q) >= RATE_LIMIT:
+        return jsonify({"error": "Too many requests. Please slow down for a moment. 💛"}), 429
+    q.append(now)
+    return None
+
+# -------------------------
+# GEO CACHE (TTL)
+# -------------------------
+GEO_TTL_SECONDS = 7 * 24 * 3600  # 7 Tage Cache
+_geo_cache = {}  # place -> (lat, lon, ts)
+
+def geo_cache_get(place: str):
+    entry = _geo_cache.get(place)
+    if not entry:
+        return None
+    lat, lon, ts = entry
+    if (time.time() - ts) > GEO_TTL_SECONDS:
+        _geo_cache.pop(place, None)
+        return None
+    return lat, lon
+
+def geo_cache_set(place: str, lat: float, lon: float):
+    _geo_cache[place] = (lat, lon, time.time())
+
+# -------------------------
+# HELPERS
+# -------------------------
 def deg_to_sign(deg: float):
     deg = deg % 360.0
     sign_index = int(deg // 30) % 12
@@ -55,20 +110,60 @@ def norm360(x: float) -> float:
     return x
 
 def angle_diff(a: float, b: float) -> float:
-    """smallest difference between angles a and b in degrees [0..180]"""
     d = abs(norm360(a) - norm360(b))
     return min(d, 360.0 - d)
 
+def midpoint_angle(a: float, b: float) -> float:
+    """Midpoint on circle (0..360)"""
+    a = norm360(a)
+    b = norm360(b)
+    d = (b - a + 360.0) % 360.0
+    if d > 180.0:
+        d -= 360.0
+    return norm360(a + d / 2.0)
+
+# -------------------------
+# GEO + TZ (FIX: NIE WIEDER 500)
+# -------------------------
 def get_latlon_from_place(place_name: str):
-    geolocator = Nominatim(user_agent="sternentyp")
-    loc = geolocator.geocode(place_name, language="de")
-    if not loc:
-        return None
-    return loc.latitude, loc.longitude
+    """
+    Robust: Timeout + Exceptions -> gibt (None, (msg, code)) statt Exception/500
+    """
+    if not place_name:
+        return None, ("Provide either (lat, lon) or place", 400)
+
+    cached = geo_cache_get(place_name)
+    if cached:
+        return cached, None
+
+    try:
+        geolocator = Nominatim(
+            user_agent="sternentyp",
+            timeout=6
+        )
+        loc = geolocator.geocode(place_name, language="de")
+        if not loc:
+            return None, ("Could not geocode place. Provide lat/lon for accuracy.", 400)
+
+        lat, lon = float(loc.latitude), float(loc.longitude)
+        geo_cache_set(place_name, lat, lon)
+        return (lat, lon), None
+
+    except (GeocoderUnavailable, GeocoderTimedOut, GeocoderServiceError):
+        # -> 503 statt 500
+        return None, (
+            "Geocoding service temporarily unavailable. Please provide lat/lon.",
+            503
+        )
+    except Exception:
+        return None, (
+            "Geocoding failed unexpectedly. Please provide lat/lon.",
+            503
+        )
 
 def infer_timezone(lat, lon):
     tf = TimezoneFinder()
-    return tf.timezone_at(lat=lat, lng=lon)
+    return tf.timezone_at(lat=float(lat), lng=float(lon))
 
 def parse_input_datetime(date_str: str, time_str: str, tz_name: str):
     local_tz = pytz.timezone(tz_name)
@@ -82,6 +177,12 @@ def jd_ut_from_utc(utc_dt: datetime) -> float:
         utc_dt.hour + utc_dt.minute / 60.0 + utc_dt.second / 3600.0
     )
 
+def zodiac_flags(zodiac: str):
+    if zodiac == "sidereal":
+        swe.set_sid_mode(swe.SIDM_FAGAN_BRADLEY, 0, 0)
+        return swe.FLG_SWIEPH | swe.FLG_SIDEREAL
+    return swe.FLG_SWIEPH
+
 def calc_bodies(jd_ut: float, flags: int):
     out = {}
     for name, p in BODIES.items():
@@ -90,9 +191,8 @@ def calc_bodies(jd_ut: float, flags: int):
     return out
 
 def calc_houses(jd_ut: float, lat: float, lon: float, house_system: str):
-    hsys = str(house_system)[0].encode("ascii")  # b'P'
+    hsys = str(house_system)[0].encode("ascii")
     houses, ascmc = swe.houses(jd_ut, float(lat), float(lon), hsys)
-    # cusps can be 12 or 13 (sometimes with dummy 0)
     if len(houses) == 13:
         cusp_list = list(houses[1:13])
     else:
@@ -103,7 +203,6 @@ def calc_houses(jd_ut: float, lat: float, lon: float, house_system: str):
     return houses_out, asc % 360.0, mc % 360.0
 
 def planet_house(planet_lon: float, houses_out: dict):
-    """Return house number 1..12 by comparing to cusps (simple method)."""
     cusps = [houses_out[f"haus_{i}"] for i in range(1, 13)]
     base = cusps[0]
     adj_cusps = [norm360(c - base) for c in cusps]
@@ -121,7 +220,6 @@ def planet_house(planet_lon: float, houses_out: dict):
     return 12
 
 def aspects_between(set_a: dict, set_b: dict):
-    """Find aspects between two sets of longitudes."""
     events = []
     for name_a, lon_a in set_a.items():
         for name_b, lon_b in set_b.items():
@@ -146,12 +244,9 @@ def aspects_between(set_a: dict, set_b: dict):
     events.sort(key=lambda x: x["orb"])
     return events
 
-def zodiac_flags(zodiac: str):
-    if zodiac == "sidereal":
-        swe.set_sid_mode(swe.SIDM_FAGAN_BRADLEY, 0, 0)
-        return swe.FLG_SWIEPH | swe.FLG_SIDEREAL
-    return swe.FLG_SWIEPH
-
+# -------------------------
+# CORE: BUILD CHART
+# -------------------------
 def build_chart(payload: dict):
     date_str = payload.get("date")
     time_str = payload.get("time")
@@ -165,13 +260,13 @@ def build_chart(payload: dict):
     if not date_str or not time_str:
         return None, ("Missing required fields: date, time", 400)
 
-    # geocode if needed
+    # geocode if needed (ROBUST)
     if lat is None or lon is None:
         if not place:
             return None, ("Provide either (lat, lon) or place", 400)
-        ll = get_latlon_from_place(place)
-        if not ll:
-            return None, ("Could not geocode place. Provide lat/lon for accuracy.", 400)
+        ll, geo_err = get_latlon_from_place(place)
+        if geo_err:
+            return None, geo_err
         lat, lon = ll
 
     # infer tz if missing
@@ -190,10 +285,8 @@ def build_chart(payload: dict):
     bodies_out = {k: deg_to_sign(v) for k, v in bodies_lon.items()}
     houses_fmt = {k: deg_to_sign(v) for k, v in houses_out.items()}
 
-    # planet houses (natal)
     planet_houses = {k: planet_house(v, houses_out) for k, v in bodies_lon.items()}
 
-    # aspects among natal bodies
     aspects = aspects_between(bodies_lon, bodies_lon)
     dedup = []
     seen = set()
@@ -227,6 +320,9 @@ def build_chart(payload: dict):
     }
     return result, None
 
+# -------------------------
+# ROUTES
+# -------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
@@ -277,7 +373,6 @@ def transits():
         transit_bodies = list(BODIES.keys())
 
     best = {}
-
     t = start_dt_utc
     while t <= end_dt_utc:
         jd_ut = jd_ut_from_utc(t)
@@ -312,7 +407,6 @@ def transits():
                                 "peak_utc": t.isoformat()
                             }
                         break
-
         t += timedelta(hours=step_hours)
 
     events = list(best.values())
@@ -414,5 +508,63 @@ def synastry():
     }
     return jsonify(out)
 
+# OPTIONAL: Composite (Midpoints)
+@app.route("/composite", methods=["POST"])
+def composite():
+    payload = request.json or {}
+    person_a = payload.get("person_a")
+    person_b = payload.get("person_b")
+    if not person_a or not person_b:
+        return jsonify({"error": "Missing required fields: person_a, person_b"}), 400
+
+    a_chart, a_err = build_chart(person_a)
+    if a_err:
+        msg, code = a_err
+        return jsonify({"error": f"Person A error: {msg}"}), code
+
+    b_chart, b_err = build_chart(person_b)
+    if b_err:
+        msg, code = b_err
+        return jsonify({"error": f"Person B error: {msg}"}), code
+
+    # midpoints for planets
+    comp_lons = {}
+    for k in a_chart["bodies"].keys():
+        a_lon = a_chart["bodies"][k]["ecliptic_longitude"]
+        b_lon = b_chart["bodies"][k]["ecliptic_longitude"]
+        comp_lons[k] = midpoint_angle(a_lon, b_lon)
+
+    # midpoint angles
+    comp_asc = midpoint_angle(
+        a_chart["ascendant"]["ecliptic_longitude"],
+        b_chart["ascendant"]["ecliptic_longitude"]
+    )
+    comp_mc = midpoint_angle(
+        a_chart["mc"]["ecliptic_longitude"],
+        b_chart["mc"]["ecliptic_longitude"]
+    )
+
+    comp_aspects = aspects_between(comp_lons, comp_lons)
+    dedup = []
+    seen = set()
+    for a in comp_aspects:
+        pair = tuple(sorted([a["body_1"], a["body_2"]])) + (a["aspect"],)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        dedup.append(a)
+
+    out = {
+        "composite": {
+            "ascendant": deg_to_sign(comp_asc),
+            "mc": deg_to_sign(comp_mc),
+            "bodies": {k: deg_to_sign(v) for k, v in comp_lons.items()},
+            "aspects": dedup[:200]
+        },
+        "note": "Composite is calculated via midpoints of longitudes (planets + Asc/MC). Houses are not computed here."
+    }
+    return jsonify(out)
+
+# -------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
