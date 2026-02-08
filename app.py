@@ -4,11 +4,13 @@ import pytz
 import time
 from collections import defaultdict, deque
 from itertools import combinations
+import re
 
 import swisseph as swe
 from timezonefinder import TimezoneFinder
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderUnavailable, GeocoderTimedOut, GeocoderServiceError
+from pytz.exceptions import UnknownTimeZoneError
 
 app = Flask(__name__)
 
@@ -80,8 +82,8 @@ PATTERN_ASPECTS = [
 # -------------------------
 # ABUSE-SCHUTZ (LIGHT)
 # -------------------------
-RATE_LIMIT = 90        # max requests
-RATE_WINDOW = 60       # per 60 seconds
+RATE_LIMIT = 90
+RATE_WINDOW = 60
 _ip_requests = defaultdict(lambda: deque())
 
 def get_client_ip():
@@ -103,9 +105,17 @@ def rate_limit_guard():
     return None
 
 # -------------------------
+# GLOBAL ERROR HANDLER (damit du nicht blind 500 bekommst)
+# -------------------------
+@app.errorhandler(Exception)
+def handle_exception(e):
+    app.logger.exception(e)
+    return jsonify({"error": "Internal server error", "detail": str(e)}), 500
+
+# -------------------------
 # GEO CACHE (TTL)
 # -------------------------
-GEO_TTL_SECONDS = 7 * 24 * 3600  # 7 Tage Cache
+GEO_TTL_SECONDS = 7 * 24 * 3600
 _geo_cache = {}  # place -> (lat, lon, ts)
 
 def geo_cache_get(place: str):
@@ -120,6 +130,57 @@ def geo_cache_get(place: str):
 
 def geo_cache_set(place: str, lat: float, lon: float):
     _geo_cache[place] = (lat, lon, time.time())
+
+# -------------------------
+# TZ PARSING (FIX UTC+6 usw.)
+# -------------------------
+def get_tzinfo(tz_name: str):
+    """
+    Akzeptiert:
+      - "Europe/Berlin", "Asia/Almaty" (pytz)
+      - "UTC", "GMT", "Z"
+      - "UTC+6", "UTC+06", "UTC+06:00", "UTC-3", "GMT+2"
+      - "+06:00", "-0330", "+6"
+    Gibt tzinfo zurück oder None.
+    """
+    if tz_name is None:
+        return None
+
+    z = str(tz_name).strip()
+    if not z:
+        return None
+
+    # Common aliases
+    if z.upper() in ("UTC", "GMT", "Z"):
+        return pytz.UTC
+
+    # Patterns: UTC+6, UTC+06, UTC+06:00, GMT-3, etc.
+    m = re.match(r'^(UTC|GMT)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?$', z, re.IGNORECASE)
+    if m:
+        sign = 1 if m.group(2) == '+' else -1
+        hh = int(m.group(3))
+        mm = int(m.group(4) or "0")
+        if hh > 23 or mm > 59:
+            return None
+        total_min = sign * (hh * 60 + mm)
+        return pytz.FixedOffset(total_min)
+
+    # Patterns: +06:00, -0330, +6
+    m2 = re.match(r'^([+-])\s*(\d{1,2})(?::?(\d{2}))?$', z)
+    if m2:
+        sign = 1 if m2.group(1) == '+' else -1
+        hh = int(m2.group(2))
+        mm = int(m2.group(3) or "0")
+        if hh > 23 or mm > 59:
+            return None
+        total_min = sign * (hh * 60 + mm)
+        return pytz.FixedOffset(total_min)
+
+    # Try pytz name
+    try:
+        return pytz.timezone(z)
+    except UnknownTimeZoneError:
+        return None
 
 # -------------------------
 # HELPERS
@@ -162,7 +223,6 @@ def pick_pattern_aspect(lon_a: float, lon_b: float):
 # -------------------------
 # ELEMENT / MODALITÄTEN BALANCE
 # -------------------------
-# Welche Bodies zählen? (du kannst hier feinjustieren)
 BALANCE_BODIES = {
     "Sonne","Mond","Merkur","Venus","Mars","Jupiter","Saturn",
     "Uranus","Neptun","Pluto","Chiron","Lilith","Mondknoten","Südknoten"
@@ -199,12 +259,9 @@ def calc_element_modal_balance(bodies_out: dict):
 # -------------------------
 # STELLIUM DETECTION
 # -------------------------
-# Default: mind. 3 Bodies im gleichen Zeichen
 STELLIUM_MIN_BODIES = 3
-# Optional: enger Stellium-Check (Orb über Longitudes), 0 = aus
-STELLIUM_ORB_DEG = 0.0  # z.B. 10.0 wenn du "enge Cluster" willst
+STELLIUM_ORB_DEG = 0.0
 
-# Welche Bodies zählen für Stellium?
 STELLIUM_BODIES = {
     "Sonne","Mond","Merkur","Venus","Mars","Jupiter","Saturn",
     "Uranus","Neptun","Pluto","Chiron","Lilith","Mondknoten","Südknoten"
@@ -223,11 +280,8 @@ def calc_stelliums(bodies_out: dict, bodies_lon: dict):
     for sign, bodies in by_sign.items():
         if len(bodies) >= STELLIUM_MIN_BODIES:
             entry = {"zeichen": sign, "bodies": sorted(bodies), "count": len(bodies)}
-
-            # Optional: Orb-Cluster innerhalb des Zeichens (wenn aktiviert)
             if STELLIUM_ORB_DEG and STELLIUM_ORB_DEG > 0:
                 lons = sorted([(b, bodies_lon[b]) for b in bodies], key=lambda x: x[1])
-                # sehr simple cluster: max-min innerhalb Zeichenbereich
                 vals = [lon for _, lon in lons]
                 span = max(vals) - min(vals)
                 entry["orb_span_deg"] = round(span, 6)
@@ -245,169 +299,111 @@ def calc_stelliums(bodies_out: dict, bodies_lon: dict):
 # -------------------------
 # ASPEKTMUSTER
 # -------------------------
-# Wir erkennen Muster nur auf einem Set von "wichtigen Punkten", sonst wird’s spammy.
 PATTERN_BODIES = [
     "Sonne","Mond","Merkur","Venus","Mars","Jupiter","Saturn","Uranus","Neptun","Pluto"
 ]
 
 def build_aspect_map(bodies_lon: dict):
-    # Map: frozenset({A,B}) -> aspect_name
     amap = {}
     for a, b in combinations(PATTERN_BODIES, 2):
         if a not in bodies_lon or b not in bodies_lon:
             continue
         asp, actual, orb = pick_pattern_aspect(bodies_lon[a], bodies_lon[b])
         if asp:
-            amap[frozenset([a, b])] = {
-                "aspect": asp,
-                "actual_angle": actual,
-                "orb": orb
-            }
+            amap[frozenset([a, b])] = {"aspect": asp, "actual_angle": actual, "orb": orb}
     return amap
 
 def has_aspect(amap, a, b, aspect_name):
-    key = frozenset([a, b])
-    v = amap.get(key)
+    v = amap.get(frozenset([a, b]))
     return v is not None and v["aspect"] == aspect_name
 
 def detect_patterns(bodies_lon: dict):
     amap = build_aspect_map(bodies_lon)
     patterns = []
 
-    # --------
-    # Grand Trine (A-B trine, B-C trine, A-C trine)
-    # --------
+    # Grand Trine
     for a, b, c in combinations(PATTERN_BODIES, 3):
         if (a in bodies_lon and b in bodies_lon and c in bodies_lon and
             has_aspect(amap, a, b, "Trigon") and
             has_aspect(amap, a, c, "Trigon") and
             has_aspect(amap, b, c, "Trigon")):
-            patterns.append({
-                "pattern": "Grand Trine",
-                "points": [a, b, c]
-            })
+            patterns.append({"pattern": "Grand Trine", "points": [a, b, c]})
 
-    # --------
-    # T-Square (A-B opposition, A-C square, B-C square)
-    # --------
+    # T-Square
     for a, b, c in combinations(PATTERN_BODIES, 3):
-        if (a in bodies_lon and b in bodies_lon and c in bodies_lon and
-            has_aspect(amap, a, b, "Opposition") and
+        if not (a in bodies_lon and b in bodies_lon and c in bodies_lon):
+            continue
+        if (has_aspect(amap, a, b, "Opposition") and
             has_aspect(amap, a, c, "Quadrat") and
             has_aspect(amap, b, c, "Quadrat")):
-            patterns.append({
-                "pattern": "T-Square",
-                "points": [a, b, c],
-                "apex": c
-            })
-        # auch andere Permutationen abdecken (apex kann a/b/c sein)
-        if (a in bodies_lon and b in bodies_lon and c in bodies_lon and
-            has_aspect(amap, a, c, "Opposition") and
+            patterns.append({"pattern": "T-Square", "points": [a, b, c], "apex": c})
+        if (has_aspect(amap, a, c, "Opposition") and
             has_aspect(amap, a, b, "Quadrat") and
             has_aspect(amap, c, b, "Quadrat")):
-            patterns.append({
-                "pattern": "T-Square",
-                "points": [a, b, c],
-                "apex": b
-            })
-        if (a in bodies_lon and b in bodies_lon and c in bodies_lon and
-            has_aspect(amap, b, c, "Opposition") and
+            patterns.append({"pattern": "T-Square", "points": [a, b, c], "apex": b})
+        if (has_aspect(amap, b, c, "Opposition") and
             has_aspect(amap, b, a, "Quadrat") and
             has_aspect(amap, c, a, "Quadrat")):
-            patterns.append({
-                "pattern": "T-Square",
-                "points": [a, b, c],
-                "apex": a
-            })
+            patterns.append({"pattern": "T-Square", "points": [a, b, c], "apex": a})
 
-    # --------
-    # Mystic Rectangle (4 Punkte: 2 Oppositions, 2 Trines, 2 Sextiles)
-    # Klassisch: A-C opposition, B-D opposition,
-    # A-B trine, C-D trine,
-    # A-D sextile, B-C sextile (oder gespiegelt)
-    # --------
+    # Mystic Rectangle
     for a, b, c, d in combinations(PATTERN_BODIES, 4):
         if not all(x in bodies_lon for x in [a, b, c, d]):
             continue
-
-        # Variante 1
         if (has_aspect(amap, a, c, "Opposition") and
             has_aspect(amap, b, d, "Opposition") and
             has_aspect(amap, a, b, "Trigon") and
             has_aspect(amap, c, d, "Trigon") and
             has_aspect(amap, a, d, "Sextil") and
             has_aspect(amap, b, c, "Sextil")):
-            patterns.append({
-                "pattern": "Mystic Rectangle",
-                "points": [a, b, c, d]
-            })
+            patterns.append({"pattern": "Mystic Rectangle", "points": [a, b, c, d]})
 
-        # Variante 2 (gespiegelt)
         if (has_aspect(amap, a, c, "Opposition") and
             has_aspect(amap, b, d, "Opposition") and
             has_aspect(amap, a, d, "Trigon") and
             has_aspect(amap, c, b, "Trigon") and
             has_aspect(amap, a, b, "Sextil") and
             has_aspect(amap, c, d, "Sextil")):
-            patterns.append({
-                "pattern": "Mystic Rectangle",
-                "points": [a, b, c, d]
-            })
+            patterns.append({"pattern": "Mystic Rectangle", "points": [a, b, c, d]})
 
-    # --------
-    # Kite: Grand Trine + 1 Opposition zu einem Vertex + 2 Sextiles
-    # --------
-    # Vorgehen: finde jedes Grand Trine (a,b,c). Suche d, das zu einem Vertex opposition ist
-    # und zu den beiden anderen Sextil.
+    # Kite (Grand Trine + Opposition + 2 Sextile)
     grand_trines = [p for p in patterns if p["pattern"] == "Grand Trine"]
     for gt in grand_trines:
         a, b, c = gt["points"]
         for d in PATTERN_BODIES:
             if d in (a, b, c) or d not in bodies_lon:
                 continue
-            # d opposition zu a + sextile zu b/c
             if (has_aspect(amap, d, a, "Opposition") and
                 has_aspect(amap, d, b, "Sextil") and
                 has_aspect(amap, d, c, "Sextil")):
                 patterns.append({"pattern": "Kite", "points": [a, b, c, d], "opposition_to": a})
-            # d opposition zu b
             if (has_aspect(amap, d, b, "Opposition") and
                 has_aspect(amap, d, a, "Sextil") and
                 has_aspect(amap, d, c, "Sextil")):
                 patterns.append({"pattern": "Kite", "points": [a, b, c, d], "opposition_to": b})
-            # d opposition zu c
             if (has_aspect(amap, d, c, "Opposition") and
                 has_aspect(amap, d, a, "Sextil") and
                 has_aspect(amap, d, b, "Sextil")):
                 patterns.append({"pattern": "Kite", "points": [a, b, c, d], "opposition_to": c})
 
-    # --------
-    # Yod: 2 Quincunx + 1 Sextil (A-B sextile, A-C quincunx, B-C quincunx)
-    # C ist Apex
-    # --------
+    # Yod: 2 Quincunx + 1 Sextil
     for a, b, c in combinations(PATTERN_BODIES, 3):
         if not all(x in bodies_lon for x in [a, b, c]):
             continue
-
-        # apex = c
         if (has_aspect(amap, a, b, "Sextil") and
             has_aspect(amap, a, c, "Quincunx") and
             has_aspect(amap, b, c, "Quincunx")):
             patterns.append({"pattern": "Yod", "points": [a, b, c], "apex": c})
-
-        # apex = b
         if (has_aspect(amap, a, c, "Sextil") and
             has_aspect(amap, a, b, "Quincunx") and
             has_aspect(amap, c, b, "Quincunx")):
             patterns.append({"pattern": "Yod", "points": [a, b, c], "apex": b})
-
-        # apex = a
         if (has_aspect(amap, b, c, "Sextil") and
             has_aspect(amap, b, a, "Quincunx") and
             has_aspect(amap, c, a, "Quincunx")):
             patterns.append({"pattern": "Yod", "points": [a, b, c], "apex": a})
 
-    # Dedup: gleiche Muster mit gleichen Punkten nur 1x
+    # Dedup
     seen = set()
     deduped = []
     for p in patterns:
@@ -424,7 +420,7 @@ def detect_patterns(bodies_lon: dict):
     }
 
 # -------------------------
-# GEO + TZ (FIX: NIE WIEDER 500)
+# GEO + TZ
 # -------------------------
 def get_latlon_from_place(place_name: str):
     if not place_name:
@@ -454,9 +450,18 @@ def infer_timezone(lat, lon):
     return tf.timezone_at(lat=float(lat), lng=float(lon))
 
 def parse_input_datetime(date_str: str, time_str: str, tz_name: str):
-    local_tz = pytz.timezone(tz_name)
+    tz = get_tzinfo(tz_name)
+    if tz is None:
+        raise ValueError(f"Unknown timezone: {tz_name}")
+
     naive_local = datetime.fromisoformat(f"{date_str}T{time_str}:00")
-    aware_local = local_tz.localize(naive_local, is_dst=None)
+
+    # pytz.UTC & FixedOffset haben kein localize -> tzinfo setzen
+    if isinstance(tz, pytz.BaseTzInfo) and hasattr(tz, "localize"):
+        aware_local = tz.localize(naive_local, is_dst=None)
+    else:
+        aware_local = naive_local.replace(tzinfo=tz)
+
     return aware_local, aware_local.astimezone(pytz.UTC)
 
 def jd_ut_from_utc(utc_dt: datetime) -> float:
@@ -561,12 +566,21 @@ def build_chart(payload: dict):
             return None, geo_err
         lat, lon = ll
 
+    if tz_name is not None and str(tz_name).strip() == "":
+        tz_name = None
+
     if not tz_name:
         tz_name = infer_timezone(float(lat), float(lon))
         if not tz_name:
             return None, ("Could not infer timezone, please provide timezone", 400)
 
-    _, utc_dt = parse_input_datetime(date_str, time_str, tz_name)
+    try:
+        _, utc_dt = parse_input_datetime(date_str, time_str, tz_name)
+    except ValueError as e:
+        return None, (str(e), 400)
+    except Exception:
+        return None, ("Invalid date/time/timezone input.", 400)
+
     jd_ut = jd_ut_from_utc(utc_dt)
     flags = zodiac_flags(zodiac)
 
@@ -583,12 +597,10 @@ def build_chart(payload: dict):
 
     bodies_out = {k: deg_to_sign(v) for k, v in bodies_lon.items()}
     houses_fmt = {k: deg_to_sign(v) for k, v in houses_out.items()}
-
     planet_houses = {k: planet_house(v, houses_out) for k, v in bodies_lon.items()}
 
     aspects = aspects_between(bodies_lon, bodies_lon)
-    dedup = []
-    seen = set()
+    dedup, seen = [], set()
     for a in aspects:
         pair = tuple(sorted([a["body_1"], a["body_2"]])) + (a["aspect"],)
         if pair in seen:
@@ -597,13 +609,8 @@ def build_chart(payload: dict):
         dedup.append(a)
     aspects = dedup
 
-    # NEW: Element/Modal Balance
     balance = calc_element_modal_balance(bodies_out)
-
-    # NEW: Stelliums
     stelliums = calc_stelliums(bodies_out, bodies_lon)
-
-    # NEW: Aspect Patterns
     patterns = detect_patterns(bodies_lon)
 
     result = {
@@ -613,7 +620,7 @@ def build_chart(payload: dict):
             "place": place,
             "lat": float(lat),
             "lon": float(lon),
-            "timezone": tz_name,
+            "timezone": str(tz_name),
             "house_system": house_system,
             "zodiac": zodiac
         },
@@ -626,8 +633,6 @@ def build_chart(payload: dict):
         "bodies_meta": bodies_meta,
         "planet_houses": planet_houses,
         "aspects": aspects,
-
-        # --- NEW OUTPUTS ---
         "balance": balance,
         "stelliums": stelliums,
         "aspect_patterns": patterns
@@ -680,16 +685,14 @@ def transits():
     natal_points["Aszendent"] = natal_result["ascendant"]["ecliptic_longitude"]
     natal_points["MC"] = natal_result["mc"]["ecliptic_longitude"]
 
-    transit_bodies = payload.get("transit_bodies")
-    if not transit_bodies:
-        transit_bodies = list(BODIES.keys())
+    transit_bodies = payload.get("transit_bodies") or list(BODIES.keys())
 
     best = {}
     t = start_dt_utc
     while t <= end_dt_utc:
         jd_ut = jd_ut_from_utc(t)
-
         trans_lons = {}
+
         for name in transit_bodies:
             if name not in BODIES:
                 continue
@@ -720,6 +723,7 @@ def transits():
                                 "peak_utc": t.isoformat()
                             }
                         break
+
         t += timedelta(hours=step_hours)
 
     events = list(best.values())
@@ -866,8 +870,7 @@ def composite():
     )
 
     comp_aspects = aspects_between(comp_lons, comp_lons)
-    dedup = []
-    seen = set()
+    dedup, seen = [], set()
     for a in comp_aspects:
         pair = tuple(sorted([a["body_1"], a["body_2"]])) + (a["aspect"],)
         if pair in seen:
